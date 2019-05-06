@@ -1,0 +1,76 @@
+#!/usr/bin/perl -w
+
+# Written 2007 by Markus Iturriaga miturria@eecs.utk.edu
+# Modified 2008
+
+use POSIX;
+
+# Configurables:
+# Paths
+$mountDir = "/tmp";
+$mountPoint = "/bin/mountpoint";
+
+# Subroutines
+
+sub get_mountpoint {
+	my $dir = shift;
+	system($mountPoint, "-q", $dir);
+	# Check for breakout condition
+	if ($? == 0) { return $dir; }
+	if ($dir eq "/") { return $dir; }
+	if ($dir eq "") { return "/"; }
+	$dir =~ /(.*)\//; # greedily match up to the last slash
+	return get_mountpoint($1);
+}
+
+sub usage {
+	print STDERR "usage: $0 snap_gtar /path/to/gtar share_name [extra_gtar_arguments]\n";
+}
+
+
+# We need at least 2 arguments
+if ($#ARGV < 1) { usage(); exit(-1); } 
+$gtarPath = $ARGV[0];
+$shareName = $ARGV[1];
+$shareName =~ s/\/$//;
+$newShare = $shareName;
+
+$i = 0;
+foreach $argnum (2 .. $#ARGV) { 
+	$argList[$i] = $ARGV[$argnum];;
+	$i++;
+}
+
+# Check to see if gtar exists
+if ( ! -x $gtarPath ) {
+	print STDERR "$gtarPath is not an executable.\n";
+	usage();
+	exit(-1);
+}
+
+
+
+$shareMount = $shareName;
+$shareMount =~ s/\//_/g;
+$shareMount = "$mountDir/backuppc$shareMount";
+
+# Check to see if anything is mounted on $shareMount
+
+open (MOUNTS, "</proc/mounts") || die "No /proc/mounts ???";
+while (<MOUNTS>) {
+	@mntpnt = split (' ', $_, 3);
+	if ($mntpnt[1] eq $shareMount) {
+		# Something is mounted on $shareMount - run the rsync.
+		# First - make sure the new directory reflects the new mount point
+		$mountPoint = get_mountpoint($shareName);
+		if ($mountPoint eq "/") { $newShare = "/" . $newShare; } # need an extra / if this is the root
+		$newShare =~ s/\Q$mountPoint\E/$shareMount/;
+		exec ("$gtarPath -C $newShare @argList") || die "Could not execute $gtarPath -C $newShare @argList";
+		#print "$gtarPath -C $newShare @argList\n";
+		#exit(0);
+	}
+}
+
+# Didn't find anything mounted in the appropriate directory, so just run the rsync from the real share.
+exec ("$gtarPath -c -v -f - -C $shareName @argList") || die "Could not execute $gtarPath -c -v -f - -C $shareName @argList";
+#print "$gtarPath -c -v -f - -C $shareName @argList\n";

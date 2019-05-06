@@ -1,0 +1,110 @@
+#!/usr/bin/perl -w
+
+# Written 2007 by Markus Iturriaga miturria@eecs.utk.edu
+
+use POSIX;
+
+
+# Configurables:
+# Paths
+$mountpoint = "/bin/mountpoint";
+$umount = "/bin/umount";
+$mountDir = "/tmp";
+$lvdisplay = "/sbin/lvdisplay";
+$lvremove = "/sbin/lvremove";
+
+# Globals
+
+sub usage {
+	print  "usage: $0 share_name\n";
+}
+
+sub get_mountpoint {
+	my $dir = shift;
+	system($mountpoint, "-q", $dir);
+	# Check for breakout condition
+	if ($? == 0) { return $dir; }
+	if ($dir eq "/") { return $dir; }
+	if ($dir eq "") { return "/"; }
+	$dir =~ /(.*)\//; # greedily match up to the last slash
+	return get_mountpoint($1);
+}
+
+sub lv_remove {
+my $device = shift;
+	system("$lvremove -f $device 2>&1 >/dev/null");
+	if ($?) {
+		die "Tried to remove snapshot device $device and failed. Snapshot might still be active.";
+	}
+}
+
+# Main 
+# Process Command Line Arguments
+# We need 1 argument
+if ($#ARGV) { usage(); exit(-1); } 
+$shareName = $ARGV[0];
+
+# Remove final slash if there
+$shareName =~ s/\/$//;
+# See if a snapshot for the share name is mounted.
+
+$snapName = $shareName;;
+$snapName =~ s/\//_/g;
+$snapName = "backuppc" . $snapName;;
+$tmpDir = "$mountDir/$snapName";
+open (MOUNTS, "</proc/mounts") || die "No /proc/mounts ???";
+$found = 0;
+while (<MOUNTS>) {
+	@mntpnt = split (' ', $_, 3);
+	if ($mntpnt[1] eq $tmpDir) {
+		# Foun[1]d a filesystem mounted at the tmpdir
+		$found = 1;
+		system($umount, $tmpDir);
+		if ($?) {
+			die "Command failed: $umount $tmpDir failed.";
+                } else {
+			print "Unmounted $tmpDir\n";
+		}
+		
+	}
+}
+close MOUNTS;
+
+if (!$found) {
+	print "Did not find anything mounted on \"$tmpDir\"\n";
+	print "Continuing, but might not find a snapshot device.\n";
+}
+
+# Remove the tmpdir
+if (-d $tmpDir) {
+	print "Removing temporary directory $tmpDir\n";
+	rmdir $tmpDir || die "Could not remove $tmpDir - not empty?";
+}
+
+# Find the snapshot device
+# We can't use the mapper device directly to remove the volume.
+
+@output = `$lvdisplay -c 2>/dev/null`;
+if ($?) {
+# lvdisplay failed
+	die "Command failed: $lvdisplay -c";
+}
+
+@gout = grep (/\Q$snapName\E/, @output);
+if (scalar @gout >1) {
+	print "Found more than one device that matched \"$snapName\":\n @gout\n";
+	print "Cannot remove snapshot device.\n";
+	exit (1);
+} elsif (scalar @gout < 1) {
+	print "Cannot find a snapshot device that matches \"$snapName\"\n";
+	exit (1);
+} 
+
+$snapDevice = $gout[0];
+$snapDevice =~ s/^\s+//; # Remove leading whitespace
+($snapDevice) = split (':', $snapDevice);
+print "Removing Snapshot Device: $snapDevice\n";
+
+lv_remove($snapDevice);
+
+

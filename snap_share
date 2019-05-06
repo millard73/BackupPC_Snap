@@ -1,0 +1,199 @@
+#!/usr/bin/perl
+
+# Written 2007 by Markus Iturriaga miturria@eecs.utk.edu
+# Updated for XFS file systems 11/2014 miturria@eecs.utk.edu
+
+use POSIX;
+
+
+# Configurables:
+# Paths
+$mountPoint = "/bin/mountpoint";
+$mount = "/bin/mount";
+$mountdir = "/tmp";
+$lvs = "/sbin/lvs";
+$lvcreate = "/sbin/lvcreate";
+$lvdisplay = "/sbin/lvdisplay";
+$lvremove = "/sbin/lvremove";
+
+$ratio = 0.15; # Percent of original volume size to be used for snapshot
+
+# Subroutines
+
+# Globals
+
+$tmpdir="";
+$snapDevice="";
+
+sub usage {
+	print  "usage: $0 share_name\n";
+}
+
+sub get_mountpoint {
+	my $dir = shift;
+	system($mountPoint, "-q", $dir);
+	# Check for breakout condition
+	if ($? == 0) { return $dir; }
+	if ($dir eq "/") { return $dir; }
+	if ($dir eq "") { return "/"; }
+	$dir =~ /(.*)\//; # greedily match up to the last slash
+	return get_mountpoint($1);
+}
+
+sub get_snapdevice {
+	my $device = shift;
+	my $name = shift;
+	my @output = `$lvdisplay -v $device 2>/dev/null`;
+	my @gout;
+
+	if ($?) {
+		# lvdisplay failed
+		print "Cannot determine if a snapshot by this name ($snapName) already exists!\n";
+		die "Command failed: $lvdisplay -v $mounts{$mountPoint}";
+	}
+
+	@gout = grep(/\Q$name\E/, @output);
+	if ( scalar @gout > 1 ) {
+		die "lvdisplay returned more than snapshot matching $name - there is some sort of problem. Aborting.\n";
+	} elsif ( scalar @gout == 0 ) { return ""; } 
+
+	else { 
+		$gout[0] =~ /\s*(\S*)/;
+
+		# We do this to uniformly return the volume name, whether it's
+		# a full path, or just the name; basically, we code to assume
+		# less information
+		$1 =~ /^(\S+\/)?(\S+)$/;
+		$lvname = $2;
+
+		# Now get the volume group
+		@gout = grep (/^\s+VG Name/, @output);
+		if ( scalar(@gout) != 1 )
+		{
+			die "lvdisplay: Did not find a (unique) volume group... Exiting.\n";
+		}
+		$gout[0] =~ /^\s+VG Name\s+(\S+)\s*$/;
+		$vgname = $1;
+
+		my $fullpath = "/dev/" . $vgname . "/" . $lvname;
+		return $fullpath;
+	}
+}
+
+sub lv_remove {
+	my $device = shift;
+	system("$lvremove -f $device 2>&1 >/dev/null");
+	if ($?) {
+		die "Tried to remove snapshot device $device and failed. Snapshot might still be active.";
+	}
+}
+
+# Main 
+# Process Command Line Arguments
+# We need 1 argument
+if ($#ARGV) { usage(); exit(-1); } 
+my $shareName = $ARGV[0];
+# In general, we don't want a trailing slash, but if the directory is the root directory
+# we don't have a choice
+$shareName =~ s/\/$// unless ($shareName eq "/");
+@mntopt = ('ro');
+
+# Check to see if shareName is a directory
+if ( ! -d $shareName ) {
+	print  "$shareName is not a directory.\n";
+	usage();
+	exit(-1);
+}
+
+# Get mountpoint and file system for share - only parse /proc/mount once
+open (MOUNTS, "</proc/mounts") || die "No /proc/mounts ???";
+while (<MOUNTS>) {
+	($device, $mntpnt, $fstype) = split (' ', $_, 4);
+	if ($device eq "/dev/root") {
+	# /dev/root is a special device. We need to find the real snapshot device.
+	# get the info from fstab - only shows file systems that were to be mounted at root.
+	open (FSTAB, "</etc/fstab") || die "No /etc/fstab ???";
+	while (my $line = <FSTAB>) {
+		($device, $mntpnt, $fstype) = split(' ', $line);
+		if ($mntpnt eq "/") { last; };
+		}
+	close FSTAB;
+	}
+# Account for devices that involve the "mapper" - we want a device in the style of
+# /dev/VOLGROUPNAME/DEVICE not /dev/mapper/VOLGROUPNAME-DEVICE
+	if ($device =~ /^\/dev\/mapper/ ) {
+		$device =~ /^\/dev\/mapper\/(.*)-(.*)/;
+		$device = "/dev/$1/$2";
+	}
+	$mounts{$mntpnt} = $device unless ($device eq "rootfs");
+	$fstypes{$mntpnt} = $fstype;
+}
+close MOUNTS;
+
+$mountPoint = get_mountpoint($shareName);
+
+print "Sharename: $shareName\nMountPoint: $mountPoint\nDevice: $mounts{$mountPoint}\nFileSystem: $fstypes{$mountPoint}\n"; 
+
+if (! $mounts{$mountPoint}) {
+	print  "Very Confused. Could not retrieve a device for $shareName. I calculated a mountpoint of $mountPoint\n";
+	usage();
+	exit(-1);
+}
+
+# Figure out if mountpoint is an lvm volume
+
+$output = `$lvs --noheadings --unbuffered --units k --options lv_size $mounts{$mountPoint} 2>/dev/null`;
+if ($?) {
+	# Mount point is not an LVM volume
+	print "Finished $0: $shareName is not located on an LVM volume.\n";
+} else {
+
+	# Handle special mount options for certain file system types
+	 
+	if (lc($fstypes{$mountPoint}) eq "xfs" ) { push(@mntopt, "nouuid", "norecovery"); }
+	if (lc($fstypes{$mountPoint}) eq "gfs2" ) { push(@mntopt, "locktable=backuppc"); }
+	$mount_options = join(",",@mntopt);
+
+	# Mount point *is* an LVM volume
+	$output =~ /\s*(\d*)/;
+	$size = ceil($1 * $ratio); # Snapshot size will be $ratio of volume size. 
+	# Take the snapshot
+	$snapName = $shareName;;
+	$snapName =~ s/\//_/g;
+	$snapName = "backuppc" . $snapName;;
+
+	# Check to see if the snapshot already exists
+	$snapDevice = get_snapdevice($mounts{$mountPoint}, $snapName);
+	if ($snapDevice ne "") {
+		die "There was already a snapshot by the name of $snapName - Aborting.";
+	} 
+	
+	# Actually take the snapshot;
+	$output = `$lvcreate -L${size}K -s -p r -n $snapName $mounts{$mountPoint} 2>/dev/null`;
+	if ($?) {
+		# lvcreate failed
+		die "Command failed: $lvcreate -L${size}K -s -p r -n $snapName $mounts{$mountPoint}";
+	} 
+	$snapDevice = get_snapdevice($mounts{$mountPoint}, $snapName);
+	print "Snapshot Device: $snapDevice\n" ;
+
+	# Create a suitable mountpoint for the snapshot
+	$tmpdir = "$mountdir/$snapName";
+	if ( -e $tmpdir ) {
+		print "Mount point $tmpdir already exists. Could be a sign of problems.\n";
+	} else {
+		mkdir $tmpdir || die "Cannot mkdir $tmpdir - Aborting";
+		print "Tmpdir: $tmpdir\n";
+	}
+
+	system($mount, "-o", $mount_options,  $snapDevice, $tmpdir);
+
+	if ($?) {
+		print  "Command failed: $mount -o $mount_options $snapDevice $tmpdir failed. Trying to remove snapshot";
+		lv_remove($snapDevice);
+		exit(-1);
+	}
+	print "Snapshot mounted. Exiting\n";
+	exit(0);
+
+}

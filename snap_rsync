@@ -1,0 +1,75 @@
+#!/usr/bin/perl -w
+
+# Written 2007 by Markus Iturriaga miturria@eecs.utk.edu
+# modified to fix missing trailing slash 03/2013
+
+use POSIX;
+
+
+# Configurables:
+# Paths
+$mountDir = "/tmp";
+$mountPoint = "/bin/mountpoint";
+
+# Subroutines
+
+sub get_mountpoint {
+	my $dir = shift;
+	system($mountPoint, "-q", $dir);
+	# Check for breakout condition
+	if ($? == 0) { return $dir; }
+	if ($dir eq "/") { return $dir; }
+	if ($dir eq "") { return "/"; }
+	$dir =~ /(.*)\//; # greedily match up to the last slash
+	return get_mountpoint($1);
+}
+
+sub usage {
+	print STDERR "usage: $0 rsync_path [rsync_arguments] share_name\n";
+}
+
+
+# We need at least 2 arguments
+if ($#ARGV < 1) { usage(); exit(-1); } 
+$rsyncPath = $ARGV[0];
+$shareName = $ARGV[$#ARGV];
+$originalShareName = $shareName; # Capture the original share name before any transformations in case we need to fall back to non-snapshot rsync
+$shareName =~ s/\/$//;
+$newShare = $shareName;
+
+$i = 0;
+foreach $argnum (1 .. $#ARGV-1) { 
+	$argList[$i] = $ARGV[$argnum];;
+	$i++;
+}
+
+# Check to see if rsync exists
+if ( ! -x $rsyncPath ) {
+	print STDERR "$rsyncPath is not an executable.\n";
+	usage();
+	exit(-1);
+}
+
+
+
+$shareMount = $shareName;
+$shareMount =~ s/\//_/g;
+$shareMount = "$mountDir/backuppc$shareMount";
+
+# Check to see if anything is mounted on $shareMount
+
+open (MOUNTS, "</proc/mounts") || die "No /proc/mounts ???";
+while (<MOUNTS>) {
+	@mntpnt = split (' ', $_, 3);
+	if ($mntpnt[1] eq $shareMount) {
+		# Something is mounted on $shareMount - run the rsync.
+		# First - make sure the new directory reflects the new mount point
+		$mountPoint = get_mountpoint($shareName);
+		if ($mountPoint eq "/") { $newShare = "/" . $newShare; } # need an extra / if this is the root
+		$newShare =~ s/\Q$mountPoint\E/$shareMount/;
+		exec ("$rsyncPath @argList $newShare/") || die "Could not execute $rsyncPath @argList $newShare";
+	}
+}
+
+# Didn't find anything mounted in the appropriate directory, so just run the rsync from the real share.
+exec ("$rsyncPath @argList $originalShareName") || die "Could not execute $rsyncPath @argList $originalShareName";
